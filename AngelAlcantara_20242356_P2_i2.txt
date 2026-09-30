@@ -1,0 +1,441 @@
+Link del video: https://itlaedudo-my.sharepoint.com/:f:/g/personal/20242356_itla_edu_do/IgDN_aKp_D9ATL6FPikZjtAoATCooH1UvsXBNc7rNldfzxk?e=N5tFAm
+
+ISP
+=========================================================================
+enable
+configure terminal
+hostname ISP
+no ip domain-lookup
+banner motd #ISP - Infraestructura 2 - Matricula 2024-2356#
+ip routing
+
+interface Ethernet0/0
+ description Enlace hacia R-USER e0/0
+ ip address 20.24.23.1 255.255.255.252
+ no shutdown
+exit
+
+interface Ethernet0/1
+ description Enlace hacia FG-Server port1
+ ip address 20.24.56.1 255.255.255.252
+ no shutdown
+exit
+
+interface Loopback0
+ description Simula Internet
+ ip address 8.8.8.8 255.255.255.255
+exit
+
+line console 0
+ logging synchronous
+ exec-timeout 0 0
+exit
+
+end
+write memory
+
+! (Solo deben aparecer 20.24.23.0/30, 20.24.56.0/30 y 8.8.8.8/32.
+!  No hay rutas hacia 10.23.56.x: el trafico privado solo pasa por la VPN
+
+
+
+=========================================================================
+SW-USUARIOS.
+=========================================================================
+
+enable
+configure terminal
+hostname SW-Usuarios
+no ip domain-lookup
+banner motd #SW-Usuarios - Infraestructura 2 - Matricula 2024-2356#
+
+vlan 10
+ name USUARIOS
+exit
+
+interface Ethernet0/0
+ description Trunk hacia R-USER e0/1
+ switchport trunk encapsulation dot1q
+ switchport mode trunk
+ switchport trunk allowed vlan 10
+ no shutdown
+exit
+
+interface Ethernet0/1
+ description Access hacia PC-Usuario
+ switchport mode access
+ switchport access vlan 10
+ spanning-tree portfast
+ no shutdown
+exit
+
+interface range Ethernet0/2 - 3
+ description No usado
+ shutdown
+exit
+
+line console 0
+ logging synchronous
+ exec-timeout 0 0
+exit
+
+end
+write memory
+
+
+
+=========================================================================
+R-USER (Cisco IOL L3-ADVENTERPRISEK9-M 15.4-2T)
+=========================================================================
+
+enable
+configure terminal
+hostname R-USER
+no ip domain-lookup
+banner motd #R-USER - Infraestructura 2 - Matricula 2024-2356#
+
+#DHCP VLAN 10
+ip dhcp excluded-address 10.23.56.1 10.23.56.9
+ip dhcp excluded-address 10.23.56.101 10.23.56.127
+ip dhcp pool VLAN10-USUARIOS
+ network 10.23.56.0 255.255.255.128
+ default-router 10.23.56.1
+ dns-server 8.8.8.8
+exit
+
+#Interfaces
+interface Ethernet0/0
+ description WAN hacia ISP
+ ip address 20.24.23.2 255.255.255.252
+ ip nat outside
+ no shutdown
+exit
+
+interface Ethernet0/1
+ description Trunk hacia SW-Usuarios
+ no ip address
+ no shutdown
+exit
+
+interface Ethernet0/1.10
+ description VLAN 10 - Usuarios
+ encapsulation dot1Q 10
+ ip address 10.23.56.1 255.255.255.128
+ ip nat inside
+exit
+
+#Ruta por defecto hacia el ISP
+ip route 0.0.0.0 0.0.0.0 20.24.23.1
+
+#NAT (excluye el trafico de la VPN)
+ip access-list extended NAT-LAN
+ deny   ip 10.23.56.0 0.0.0.127 10.23.56.128 0.0.0.15
+ permit ip 10.23.56.0 0.0.0.127 any
+exit
+ip nat inside source list NAT-LAN interface Ethernet0/0 overload
+
+# ============================================================
+# VPN SITE-TO-SITE IPsec hacia el FortiGate
+# ============================================================
+
+#Phase 1 (ISAKMP)
+# (des-md5 para coincidir con la licencia de evaluacion del FortiGate)
+crypto isakmp policy 10
+ encryption des
+ hash md5
+ authentication pre-share
+ group 14
+ lifetime 86400
+exit
+crypto isakmp key <PRE-SHARED-KEY> address 20.24.56.2
+
+#Phase 2 (IPsec)
+crypto ipsec transform-set TS-FORTIGATE esp-des esp-md5-hmac
+ mode tunnel
+exit
+
+#Trafico interesante (selectores de la VPN)
+ip access-list extended VPN-TRAFICO
+ permit ip 10.23.56.0 0.0.0.127 10.23.56.128 0.0.0.15
+exit
+
+#Crypto map
+crypto map CMAP-FORTIGATE 10 ipsec-isakmp
+ set peer 20.24.56.2
+ set transform-set TS-FORTIGATE
+ set pfs group14
+ set security-association lifetime seconds 43200
+ match address VPN-TRAFICO
+exit
+
+interface Ethernet0/0
+ crypto map CMAP-FORTIGATE
+exit
+
+line console 0
+ logging synchronous
+ exec-timeout 0 0
+exit
+
+end
+write memory
+
+# --- Verificacion ---
+# show ip interface brief
+# ping 20.24.23.1
+# ping 20.24.56.2
+# ping 10.23.56.129 source 10.23.56.1 repeat 10   (levanta el tunel)
+# show crypto isakmp sa                           (estado QM_IDLE / ACTIVE)
+# show crypto ipsec sa                            (encaps / decaps > 0)
+# show ip dhcp binding
+
+
+
+=========================================================================
+FG-Server (FortiGate VM64-KVM v6.4.0)
+=========================================================================
+
+#Paso 0: acceso de gestion (unico paso por consola)
+# (Se uso "set defaultgw disable" para no tomar la ruta por defecto de Cloud0)
+config system interface
+    edit "port3"
+        set mode dhcp
+        set defaultgw disable
+        set allowaccess ping https ssh http
+    next
+end
+
+#Hostname (GUI: System > Settings)
+config system global
+    set hostname "FG-Server"
+end
+
+#Interfaces (GUI: Network > Interfaces)
+config system interface
+    edit "port1"
+        set alias "WAN"
+        set mode static
+        set ip 20.24.56.2 255.255.255.252
+        set allowaccess ping
+        set role wan
+    next
+    edit "port2"
+        set mode static
+        set ip 10.23.56.129 255.255.255.240
+        set allowaccess ping
+        set role lan
+    next
+end
+
+#Ruta por defecto hacia el ISP (GUI: Network > Static Routes)
+config router static
+    edit 1
+        set gateway 20.24.56.1
+        set device "port1"
+    next
+end
+
+#Politica de salida con NAT (GUI: Policy & Objects > Firewall Policy)
+config firewall policy
+    edit 1
+        set name "LAN-a-Internet"
+        set srcintf "port2"
+        set dstintf "port1"
+        set srcaddr "all"
+        set dstaddr "all"
+        set action accept
+        set schedule "always"
+        set service "ALL"
+        set nat enable
+    next
+end
+
+# ============================================================
+# VPN SITE-TO-SITE (GUI: VPN > IPsec Wizard > Site to Site - Cisco)
+# ============================================================
+config firewall address
+    edit "VPN-A-CISCO_local_subnet_1"
+        set subnet 10.23.56.128 255.255.255.240
+    next
+    edit "VPN-A-CISCO_remote_subnet_1"
+        set subnet 10.23.56.0 255.255.255.128
+    next
+end
+
+config firewall addrgrp
+    edit "VPN-A-CISCO_local"
+        set member "VPN-A-CISCO_local_subnet_1"
+        set comment "VPN: VPN-A-CISCO (Created by VPN wizard)"
+    next
+    edit "VPN-A-CISCO_remote"
+        set member "VPN-A-CISCO_remote_subnet_1"
+        set comment "VPN: VPN-A-CISCO (Created by VPN wizard)"
+    next
+end
+
+#Phase 1
+#(Propuesta des-md5, limitada por la licencia de evaluacion)
+config vpn ipsec phase1-interface
+    edit "VPN-A-CISCO"
+        set interface "port1"
+        set ike-version 1
+        set mode main
+        set peertype any
+        set net-device disable
+        set proposal des-md5 des-sha1
+        set dhgrp 14 5
+        set keylife 86400
+        set remote-gw 20.24.23.2
+        set psksecret <PRE-SHARED-KEY>
+        set comments "VPN: VPN-A-CISCO (Created by VPN wizard)"
+    next
+end
+
+#Phase 2
+config vpn ipsec phase2-interface
+    edit "VPN-A-CISCO"
+        set phase1name "VPN-A-CISCO"
+        set proposal des-md5 des-sha1
+        set pfs enable
+        set dhgrp 14 5
+        set keylifeseconds 43200
+        set src-addr-type name
+        set dst-addr-type name
+        set src-name "VPN-A-CISCO_local"
+        set dst-name "VPN-A-CISCO_remote"
+    next
+end
+
+#Ruta hacia la red remota por el tunel + ruta blackhole
+config router static
+    edit 2
+        set device "VPN-A-CISCO"
+        set dstaddr "VPN-A-CISCO_remote"
+    next
+    edit 3
+        set distance 254
+        set blackhole enable
+        set dstaddr "VPN-A-CISCO_remote"
+    next
+end
+
+#Politicas de la VPN (sin NAT)
+config firewall policy
+    edit 2
+        set name "vpn_VPN-A-CISCO_local"
+        set srcintf "port2"
+        set dstintf "VPN-A-CISCO"
+        set srcaddr "VPN-A-CISCO_local"
+        set dstaddr "VPN-A-CISCO_remote"
+        set action accept
+        set schedule "always"
+        set service "ALL"
+    next
+    edit 3
+        set name "vpn_VPN-A-CISCO_remote"
+        set srcintf "VPN-A-CISCO"
+        set dstintf "port2"
+        set srcaddr "VPN-A-CISCO_remote"
+        set dstaddr "VPN-A-CISCO_local"
+        set action accept
+        set schedule "always"
+        set service "ALL"
+    next
+end
+
+# --- Verificacion ---
+# execute ping 20.24.56.1
+# execute ping 20.24.23.2            
+# execute ping 8.8.8.8              
+# show full-configuration vpn ipsec phase1-interface VPN-A-CISCO
+# show full-configuration vpn ipsec phase2-interface VPN-A-CISCO
+
+
+
+
+=========================================================================
+Web-Server (Ubuntu Server 20.04)
+=========================================================================
+
+#Red: /etc/netplan/01-lab.yaml
+network:
+  version: 2
+  ethernets:
+    eth0:
+      addresses: [10.23.56.130/28]
+      routes:
+        - to: 0.0.0.0/0
+          via: 10.23.56.129
+
+#cloud-init: /etc/cloud/cloud.cfg.d/99-disable-network-config.cfg
+network: {config: disabled}
+
+#Paquetes instalados
+apt install -y apache2 openssl curl traceroute
+
+#Certificado autofirmado
+openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+  -keyout /etc/ssl/private/lab.key \
+  -out /etc/ssl/certs/lab.crt \
+  -subj "/C=DO/ST=Santo Domingo/O=ITLA/OU=Lab VPN/CN=10.23.56.130" \
+  -addext "subjectAltName=IP:10.23.56.130"
+
+#Apache HTTPS: /etc/apache2/sites-available/default-ssl.conf
+SSLCertificateFile      /etc/ssl/certs/lab.crt
+SSLCertificateKeyFile   /etc/ssl/private/lab.key
+
+a2enmod ssl
+a2ensite default-ssl
+systemctl restart apache2
+systemctl enable apache2
+
+#Redireccion HTTP -> HTTPS: /etc/apache2/sites-available/000-default.conf
+Redirect permanent / https://10.23.56.130/
+
+#Pagina: /var/www/html/index.html
+# (Titulo: "Infraestructura 2 - VPN Site-to-Site Cisco y FortiGate")
+
+#Guardar en disco y apagar correctamente antes de mover cables
+sync
+shutdown -h now
+
+# --- Verificacion ---
+# ip a                              (eth0 con 10.23.56.130/28)
+# ping -c 4 10.23.56.129            (gateway FG-Server)
+# curl -k https://10.23.56.130      (devuelve la pagina)
+# ufw status                        (inactive)
+
+
+
+=========================================================================
+PC-Usuario (Docker pnetlab/ubuntu_sv)
+=========================================================================
+
+
+#Configuracion del nodo en PNETLab
+#Eth1 DHCP: activado (IP recibida del R-USER en VLAN 10)
+#IP obtenida: 10.23.56.10/25 - Gateway: 10.23.56.1
+
+dhclient eth1
+ip a
+ip route
+
+#Instalacion temporal de traceroute (por la red de Docker)
+ip route replace default via 10.177.0.1 dev eth0
+echo "nameserver 8.8.8.8" > /etc/resolv.conf
+apt update && apt install -y traceroute
+ip route replace default via 10.23.56.1 dev eth1    # devolver ruta al R-USER
+
+#Pruebas con el tunel activo (deben funcionar)
+ping -c 4 10.23.56.1
+ping -c 4 10.23.56.130                   
+traceroute -n 10.23.56.130
+#  1  10.23.56.1
+#  2  * * *        (FG-Server: su respuesta ICMP queda fuera de los selectores)
+#  3  10.23.56.130
+curl -k https://10.23.56.130
+
+#Pruebas con el tunel deshabilitado (deben fallar)
+ping -c 4 10.23.56.130
+traceroute -n -m 5 10.23.56.130
+curl -k --max-time 5 https://10.23.56.130
